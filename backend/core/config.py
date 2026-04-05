@@ -3,8 +3,7 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    database_url: str = "postgresql://postgres:postgres@localhost:5432/mmm_platform"
-    redis_url: str = "redis://localhost:6379/0"
+    database_url: str = "sqlite:///./mmm.db"
     upload_dir: str = "./uploads"
 
     class Config:

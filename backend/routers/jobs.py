@@ -122,20 +122,16 @@ def list_jobs(
 
 def _dispatch_tasks(job_id: str, models: List[str]):
     import threading
-    from core.config import settings
-
-    use_celery = not settings.redis_url.startswith("memory")
 
     def _run():
         if "pymc" in models:
             from workers.pymcmarketing_worker import run_pymc
-            run_pymc.delay(job_id) if use_celery else run_pymc(job_id)
+            run_pymc(job_id)
         if "robyn" in models:
             from workers.robyn_worker import run_robyn
-            run_robyn.delay(job_id) if use_celery else run_robyn(job_id)
+            run_robyn(job_id)
         if "meridian" in models:
             from workers.meridian_worker import run_meridian
-            run_meridian.delay(job_id) if use_celery else run_meridian(job_id)
+            run_meridian(job_id)
 
-    # Run in background thread so the API response returns immediately
     threading.Thread(target=_run, daemon=True).start()

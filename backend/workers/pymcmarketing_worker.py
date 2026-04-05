@@ -12,7 +12,6 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from workers.celery_app import celery_app
 from core.database import SessionLocal
 from models.db import Job, Result
 from services.aggregator import aggregate
@@ -45,8 +44,7 @@ def _ensure_wide(df: pd.DataFrame) -> pd.DataFrame:
     return pivot
 
 
-@celery_app.task(bind=True, name="workers.pymcmarketing_worker.run_pymc")
-def run_pymc(self, job_id: str):
+def run_pymc(job_id: str):
     db = SessionLocal()
     try:
         job = db.query(Job).filter(Job.id == job_id).first()

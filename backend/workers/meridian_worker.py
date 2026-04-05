@@ -11,7 +11,6 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from workers.celery_app import celery_app
 from core.database import SessionLocal
 from models.db import Job, Result
 from services.aggregator import aggregate
@@ -24,8 +23,7 @@ from workers.pymcmarketing_worker import (
 )
 
 
-@celery_app.task(bind=True, name="workers.meridian_worker.run_meridian")
-def run_meridian(self, job_id: str):
+def run_meridian(job_id: str):
     db = SessionLocal()
     try:
         job = db.query(Job).filter(Job.id == job_id).first()
