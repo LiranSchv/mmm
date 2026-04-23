@@ -4,13 +4,13 @@ sqlalchemy==2.0.30
 alembic==1.13.1
 psycopg2-binary==2.9.9
 pandas>=2.2.2
-numpy>=2.0
+numpy>=1.23.2,<2.0
 holidays==0.46
 openpyxl==3.1.2
 python-multipart==0.0.9
 pydantic==2.7.1
 pydantic-settings==2.2.1
 # MMM model libraries
-pymc-marketing>=0.7.0
+pymc-marketing>=0.7.0,<0.18.0
 google-meridian
 scipy>=1.13.0
