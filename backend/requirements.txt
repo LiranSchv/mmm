@@ -12,4 +12,5 @@ pydantic==2.7.1
 pydantic-settings==2.2.1
 # MMM model libraries
 pymc-marketing>=0.7.0
+google-meridian
 scipy>=1.13.0
