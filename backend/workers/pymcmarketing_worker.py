@@ -110,13 +110,15 @@ def _fit_pymc_mmm(
     try:
         from pymc_marketing.mmm import MMM, GeometricAdstock, LogisticSaturation
 
-        X = df[["date"] + spend_cols].copy()
+        # PyMC-Marketing requires one row per date — collapse any remaining dims
+        X = df.groupby("date")[spend_cols].sum().reset_index()
+        y_series = df.groupby("date")["ftbs"].sum().reset_index()["ftbs"]
+        y = y_series.values.astype(float)
+
         control_cols = None
         if not season_feats.empty:
-            X = X.join(season_feats, how="left").fillna(0)
+            X = X.merge(season_feats.reset_index(), on="date", how="left").fillna(0)
             control_cols = list(season_feats.columns)
-
-        y = df["ftbs"].values.astype(float)
 
         mmm = MMM(
             adstock=GeometricAdstock(l_max=config.get("adstock_max_lag", 8)),
