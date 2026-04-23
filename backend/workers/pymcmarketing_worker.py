@@ -109,80 +109,71 @@ def _fit_pymc_mmm(
 ) -> dict:
     try:
         from pymc_marketing.mmm import MMM, GeometricAdstock, LogisticSaturation
-        import pymc as pm
+
+        X = df[["date"] + spend_cols].copy()
+        control_cols = None
+        if not season_feats.empty:
+            X = X.join(season_feats, how="left").fillna(0)
+            control_cols = list(season_feats.columns)
+
+        y = df["ftbs"].values.astype(float)
 
         mmm = MMM(
             adstock=GeometricAdstock(l_max=config.get("adstock_max_lag", 8)),
             saturation=LogisticSaturation(),
             date_column="date",
             channel_columns=spend_cols,
-            control_columns=list(season_feats.columns) if not season_feats.empty else None,
+            control_columns=control_cols,
         )
 
-        X = df[["date"] + spend_cols].copy()
-        if not season_feats.empty:
-            X = X.join(season_feats, on="date", how="left").fillna(0)
-        y = df["ftbs"].values
+        mmm.fit(
+            X=X,
+            y=y,
+            draws=config.get("draws", 500),
+            tune=config.get("tune", 200),
+            chains=2,
+            target_accept=0.9,
+            random_seed=42,
+            progressbar=False,
+        )
 
-        with mmm:
-            idata = pm.sample(
-                draws=config.get("draws", 1000),
-                tune=config.get("tune", 500),
-                target_accept=0.9,
-                random_seed=42,
-                progressbar=False,
-            )
-
-        return _extract_pymc_results(mmm, idata, df, spend_cols, channels)
+        return _extract_pymc_results(mmm, df, spend_cols, channels)
 
     except ImportError:
-        # PyMC not installed — return realistic synthetic results for dev
         return _synthetic_results(df, spend_cols, channels, model_name="pymc")
 
 
-def _extract_pymc_results(mmm, idata, df, spend_cols, channels):
-    contributions = []
-    saturation = []
-
+def _extract_pymc_results(mmm, df, spend_cols, channels):
     try:
-        channel_contributions = mmm.compute_channel_contribution_original_scale(idata)
-        total_ftbs = df["ftbs"].sum()
+        # Channel contributions (shape: chain x draw x date x channel)
+        contrib_da = mmm.compute_channel_contribution_original_scale()
+        total_by_channel = contrib_da.sum("date").mean(["chain", "draw"])
+        total_ftbs = float(df["ftbs"].sum())
 
-        for i, (col, ch) in enumerate(zip(spend_cols, channels)):
-            contrib_mean = float(channel_contributions.sel(channel=col).mean().values)
-            contrib_pct = contrib_mean / max(total_ftbs, 1) * 100
+        contributions = []
+        for col, ch in zip(spend_cols, channels):
+            try:
+                contrib_val = float(total_by_channel.sel(channel=col).values)
+            except Exception:
+                contrib_val = float(total_by_channel.isel(channel=spend_cols.index(col)).values)
             spend = float(df[col].sum())
-            roi = contrib_mean / max(spend, 1)
-
             contributions.append({
                 "channel": ch,
-                "contribution_pct": round(contrib_pct, 2),
+                "contribution_pct": round(contrib_val / max(total_ftbs, 1) * 100, 2),
                 "spend": round(spend, 2),
-                "roi": round(roi, 4),
+                "roi": round(contrib_val / max(spend, 1), 4),
             })
-
-            # Saturation curve
-            spend_range = np.linspace(0, df[col].max() * 1.5, 50)
-            sat_values = [float(mmm.saturation.function(s, **{}).mean()) for s in spend_range]
-            threshold = float(df[col].quantile(0.75))
-
-            saturation.append({
-                "channel": ch,
-                "curve_points": [
-                    {"spend": round(float(s), 2), "response": round(float(v), 4)}
-                    for s, v in zip(spend_range, sat_values)
-                ],
-                "current_spend": round(float(df[col].mean()), 2),
-                "threshold": round(threshold, 2),
-                "is_saturated": float(df[col].mean()) > threshold,
-            })
-
     except Exception:
         return _synthetic_results(df, spend_cols, channels, model_name="pymc")
 
-    y_pred = df["ftbs"].mean()  # placeholder
-    y_true = df["ftbs"]
-    metrics = _compute_metrics(y_true.values, np.full(len(y_true), y_pred))
+    saturation = _extract_saturation_curves(mmm, df, spend_cols, channels)
+
+    # Fitted values for metrics
+    try:
+        y_pred = mmm.idata.posterior_predictive["y"].mean(["chain", "draw"]).values
+    except Exception:
+        y_pred = np.full(len(df), df["ftbs"].mean())
+    metrics = _compute_metrics(df["ftbs"].values, y_pred)
 
     decomposition = _build_decomposition(df, contributions)
 
@@ -192,6 +183,44 @@ def _extract_pymc_results(mmm, idata, df, spend_cols, channels):
         "saturation": saturation,
         "decomposition": decomposition,
     }
+
+
+def _extract_saturation_curves(mmm, df, spend_cols, channels):
+    saturation = []
+    posterior = mmm.idata.posterior
+
+    for i, (col, ch) in enumerate(zip(spend_cols, channels)):
+        max_spend = float(df[col].max()) * 1.5 or 1.0
+        spend_range = np.linspace(0, max_spend, 50)
+
+        try:
+            # LogisticSaturation uses lam parameter; beta scales input
+            # Variable names: saturation_lam, saturation_beta (per channel)
+            lam = float(posterior["saturation_lam"].isel(channel=i).mean(["chain", "draw"]).values)
+            beta = float(posterior["saturation_beta"].isel(channel=i).mean(["chain", "draw"]).values)
+            curve = lam / (1.0 + np.exp(-beta * spend_range))
+            # Normalise so curve starts at 0
+            curve = curve - curve[0]
+        except Exception:
+            # Fallback: Hill-style curve from spend stats
+            k = float(df[col].quantile(0.7)) or 1.0
+            curve = spend_range ** 2 / (k ** 2 + spend_range ** 2)
+
+        current = float(df[col].mean())
+        threshold = float(df[col].quantile(0.75))
+
+        saturation.append({
+            "channel": ch,
+            "curve_points": [
+                {"spend": round(float(s), 2), "response": round(float(v), 4)}
+                for s, v in zip(spend_range, curve)
+            ],
+            "current_spend": round(current, 2),
+            "threshold": round(threshold, 2),
+            "is_saturated": current > threshold,
+        })
+
+    return saturation
 
 
 def _synthetic_results(df: pd.DataFrame, spend_cols: list, channels: list, model_name: str) -> dict:

@@ -123,15 +123,12 @@ def list_jobs(
 def _dispatch_tasks(job_id: str, models: List[str]):
     import threading
 
-    def _run():
-        if "pymc" in models:
-            from workers.pymcmarketing_worker import run_pymc
-            run_pymc(job_id)
-        if "robyn" in models:
-            from workers.robyn_worker import run_robyn
-            run_robyn(job_id)
-        if "meridian" in models:
-            from workers.meridian_worker import run_meridian
-            run_meridian(job_id)
+    runners = {
+        "pymc": lambda: __import__("workers.pymcmarketing_worker", fromlist=["run_pymc"]).run_pymc(job_id),
+        "robyn": lambda: __import__("workers.robyn_worker", fromlist=["run_robyn"]).run_robyn(job_id),
+        "meridian": lambda: __import__("workers.meridian_worker", fromlist=["run_meridian"]).run_meridian(job_id),
+    }
 
-    threading.Thread(target=_run, daemon=True).start()
+    for model in models:
+        if model in runners:
+            threading.Thread(target=runners[model], daemon=True).start()
