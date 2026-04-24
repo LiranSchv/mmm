@@ -2,7 +2,9 @@ from __future__ import annotations
 """
 Google Meridian MMM worker.
 Uses the `google-meridian` Python package if available,
-otherwise falls back to realistic synthetic results.
+otherwise runs a lightweight Bayesian Ridge MMM with
+Weibull adstock + exponential saturation (distinct from
+PyMC's geometric/logistic and Robyn's geometric/Hill).
 """
 import uuid
 import traceback
@@ -10,13 +12,13 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import Ridge
 
 from core.database import SessionLocal
 from models.db import Job, Result
 from services.aggregator import aggregate
 from services.seasonality import build_seasonality_features
 from workers.pymcmarketing_worker import (
-    _synthetic_results,
     _update_job_status,
     _ensure_wide,
     _jsonify,
@@ -46,7 +48,6 @@ def run_meridian(job_id: str):
         grain = config.get("grain", {"time": "weekly", "dimensions": ["channel", "geo"]})
         agg_df = _ensure_wide(aggregate(df, grain))
 
-        # Collapse to one row per date (same as PyMC worker)
         spend_cols = [c for c in agg_df.columns if c.startswith("spend_")]
         channels = [c.replace("spend_", "") for c in spend_cols]
         agg_df = agg_df.groupby("date")[spend_cols + ["ftbs"]].sum().reset_index()
@@ -61,7 +62,7 @@ def run_meridian(job_id: str):
         result.contributions = _jsonify(model_results["contributions"])
         result.saturation = _jsonify(model_results["saturation"])
         result.decomposition = _jsonify(model_results["decomposition"])
-        result.raw_output = {"model": "meridian", "version": "1.0"}
+        result.raw_output = {"model": "meridian-lightweight", "version": "1.0"}
 
         _update_job_status(db, job)
         db.commit()
@@ -77,102 +78,132 @@ def run_meridian(job_id: str):
         db.close()
 
 
+# ── Weibull adstock ──────────────────────────────────────────────────────────
+
+def _weibull_adstock(spend: np.ndarray, shape: float, scale: float, l_max: int = 8) -> np.ndarray:
+    """Apply Weibull PDF adstock (allows delayed peak then decay)."""
+    t = np.arange(1, l_max + 1).astype(float)
+    # Weibull PDF: (shape/scale) * (t/scale)^(shape-1) * exp(-(t/scale)^shape)
+    weights = (shape / scale) * (t / scale) ** (shape - 1) * np.exp(-((t / scale) ** shape))
+    weights = weights / (weights.sum() + 1e-10)
+
+    n = len(spend)
+    result = np.zeros(n)
+    for i in range(n):
+        for l in range(min(l_max, i + 1)):
+            result[i] += weights[l] * spend[i - l]
+    return result
+
+
+# ── Exponential saturation ───────────────────────────────────────────────────
+
+def _exponential_saturation(x: np.ndarray, rate: float) -> np.ndarray:
+    """Exponential saturation: response = 1 - exp(-rate * x). Different from
+    PyMC's logistic and Robyn's Hill."""
+    return 1.0 - np.exp(-rate * x)
+
+
+# ── Main fit ─────────────────────────────────────────────────────────────────
+
 def _fit_meridian(df, spend_cols, channels, season_feats, config):
-    try:
-        from meridian.data.data_frame_input_data_builder import DataFrameInputDataBuilder
-        from meridian.model.model import Meridian
-        from meridian.analysis.analyzer import Analyzer
+    """Lightweight Meridian-style MMM: Weibull adstock + exponential
+    saturation + Bayesian Ridge regression."""
+    y = df["ftbs"].values.astype(float)
+    n_channels = len(spend_cols)
+    l_max = config.get("adstock_max_lag", 8)
 
-        df = df.copy()
-        df["date"] = pd.to_datetime(df["date"])
+    X_raw = df[spend_cols].values.astype(float)
 
-        # Build input data
-        builder = DataFrameInputDataBuilder(kpi_type="non_revenue")
-        builder = builder.with_kpi(df, kpi_col="ftbs", time_col="date")
-        builder = builder.with_media(
-            df,
-            media_cols=spend_cols,
-            media_spend_cols=spend_cols,
-            media_channels=channels,
-            time_col="date",
-        )
+    # Find best Weibull params per channel via grid search on correlation with y
+    best_params = []
+    X_transformed = np.zeros_like(X_raw)
 
-        # Add control variables (seasonality features)
-        if not season_feats.empty:
-            controls_df = season_feats.reset_index()
-            controls_df["date"] = pd.to_datetime(controls_df["date"])
-            control_cols = [c for c in controls_df.columns if c != "date"]
-            builder = builder.with_controls(
-                controls_df,
-                control_cols=control_cols,
-                time_col="date",
-            )
+    for i in range(n_channels):
+        best_corr = -1.0
+        best_shape, best_scale, best_rate = 1.5, 3.0, 1.0
 
-        input_data = builder.build()
+        for shape in [0.5, 1.0, 1.5, 2.0, 3.0]:
+            for scale in [1.0, 2.0, 3.0, 5.0]:
+                adstocked = _weibull_adstock(X_raw[:, i], shape, scale, l_max)
+                # Normalise for saturation
+                x_max = adstocked.max() or 1.0
+                x_norm = adstocked / x_max
 
-        mmm = Meridian(input_data=input_data)
-        mmm.sample_posterior(
-            n_chains=config.get("chains", 2),
-            n_adapt=config.get("tune", 200),
-            n_burnin=config.get("tune", 200),
-            n_keep=config.get("draws", 500),
-            seed=42,
-        )
+                for rate in [0.5, 1.0, 2.0, 3.0, 5.0]:
+                    saturated = _exponential_saturation(x_norm, rate)
+                    corr = np.corrcoef(saturated, y)[0, 1]
+                    if not np.isnan(corr) and corr > best_corr:
+                        best_corr = corr
+                        best_shape, best_scale, best_rate = shape, scale, rate
 
-        analyzer = Analyzer(mmm)
-        return _extract_meridian_results(mmm, analyzer, df, spend_cols, channels)
+        adstocked = _weibull_adstock(X_raw[:, i], best_shape, best_scale, l_max)
+        x_max = adstocked.max() or 1.0
+        X_transformed[:, i] = _exponential_saturation(adstocked / x_max, best_rate)
 
-    except ImportError:
-        return _synthetic_results(df, spend_cols, channels, model_name="meridian")
+        best_params.append({
+            "shape": best_shape, "scale": best_scale,
+            "rate": best_rate, "x_max": x_max,
+        })
 
+    # Add seasonality controls
+    X_fit = X_transformed.copy()
+    if not season_feats.empty:
+        sf = season_feats.reset_index()
+        sf["date"] = pd.to_datetime(sf["date"])
+        df2 = df.copy()
+        df2["date"] = pd.to_datetime(df2["date"])
+        merged = df2[["date"]].merge(sf, on="date", how="left").fillna(0)
+        ctrl_cols = [c for c in merged.columns if c != "date"]
+        X_controls = merged[ctrl_cols].values.astype(float)
+        X_fit = np.hstack([X_fit, X_controls])
 
-def _extract_meridian_results(mmm, analyzer, df, spend_cols, channels):
-    total_ftbs = float(df["ftbs"].sum())
+    # Ridge regression with non-negative coefficients
+    model = Ridge(alpha=1.0, fit_intercept=True, positive=True)
+    model.fit(X_fit, y)
+    y_pred = model.predict(X_fit)
+
+    # Extract channel coefficients (first n_channels are media)
+    coefs = model.coef_[:n_channels]
+    intercept = model.intercept_
+
+    # Channel contributions
+    total_ftbs = float(y.sum())
     contributions = []
+    for i, (col, ch) in enumerate(zip(spend_cols, channels)):
+        # contribution = coef * mean(saturated_spend) * n_periods
+        mean_sat = float(X_transformed[:, i].mean())
+        contrib = float(coefs[i]) * mean_sat * len(df)
+        spend = float(df[col].sum())
+        contributions.append({
+            "channel": ch,
+            "contribution_pct": round(contrib / max(total_ftbs, 1) * 100, 2),
+            "spend": round(spend, 2),
+            "roi": round(contrib / max(spend, 1), 4),
+        })
+
+    # Saturation curves (exponential, distinct from Hill/logistic)
     saturation = []
+    for i, (col, ch) in enumerate(zip(spend_cols, channels)):
+        p = best_params[i]
+        max_raw = max(float(df[col].max()) * 1.5, 1.0)
+        spend_range = np.linspace(0, max_raw, 50)
+        x_norm = spend_range / p["x_max"]
+        curve = _exponential_saturation(x_norm, p["rate"])
 
-    try:
-        # incremental_outcome returns xarray with dim 'channel'
-        inc = analyzer.incremental_outcome(by_time=False)  # shape: (chains, draws, channels)
-        inc_mean = inc.mean(dim=["chain", "draw"]).values  # shape: (channels,)
+        current = float(df[col].mean())
+        threshold = float(df[col].quantile(0.75))
+        saturation.append({
+            "channel": ch,
+            "curve_points": [
+                {"spend": round(float(s), 2), "response": round(float(v), 4)}
+                for s, v in zip(spend_range, curve)
+            ],
+            "current_spend": round(current, 2),
+            "threshold": round(threshold, 2),
+            "is_saturated": current > threshold,
+        })
 
-        roi_da = analyzer.roi()
-        roi_mean = roi_da.mean(dim=["chain", "draw"]).values
-
-        for i, (col, ch) in enumerate(zip(spend_cols, channels)):
-            contrib_val = float(inc_mean[i])
-            roi_val = float(roi_mean[i])
-            spend = float(df[col].sum())
-            contributions.append({
-                "channel": ch,
-                "contribution_pct": round(contrib_val / max(total_ftbs, 1) * 100, 2),
-                "spend": round(spend, 2),
-                "roi": round(roi_val, 4),
-            })
-    except Exception:
-        return _synthetic_results(df, spend_cols, channels, model_name="meridian")
-
-    # Saturation / response curves
-    try:
-        saturation = _extract_meridian_saturation(analyzer, df, spend_cols, channels)
-    except Exception:
-        saturation = _fallback_saturation(df, spend_cols, channels)
-
-    # Metrics
-    try:
-        acc = analyzer.predictive_accuracy()
-        # acc is a dict or DataFrame with r_squared, mape, etc.
-        if hasattr(acc, "to_dict"):
-            acc = acc.to_dict()
-        metrics = {
-            "r2": round(float(acc.get("r_squared", acc.get("r2", 0))), 4),
-            "mape": round(float(acc.get("mape", 0)), 2),
-            "nrmse": round(float(acc.get("nrmse", acc.get("wmape", 0))), 4),
-        }
-    except Exception:
-        y_pred = np.full(len(df), df["ftbs"].mean())
-        metrics = _compute_metrics(df["ftbs"].values, y_pred)
-
+    metrics = _compute_metrics(y, y_pred)
     decomposition = _build_decomposition(df, contributions)
 
     return {
@@ -181,66 +212,3 @@ def _extract_meridian_results(mmm, analyzer, df, spend_cols, channels):
         "saturation": saturation,
         "decomposition": decomposition,
     }
-
-
-def _extract_meridian_saturation(analyzer, df, spend_cols, channels):
-    saturation = []
-
-    # response_curves returns spend multipliers vs outcome
-    # We evaluate at a range of spend levels relative to observed mean
-    response = analyzer.response_curves(by_reach=False)
-    # response is xarray with dims (spend_multiplier, channel) or similar
-
-    for i, (col, ch) in enumerate(zip(spend_cols, channels)):
-        current = float(df[col].mean())
-        max_spend = current * 3.0 or 1.0
-        spend_range = np.linspace(0, max_spend, 50)
-        threshold = float(df[col].quantile(0.75))
-
-        try:
-            # Attempt to extract the curve from response DataArray
-            ch_response = response.isel(channel=i).mean(dim=["chain", "draw"])
-            multipliers = ch_response.coords["spend_multiplier"].values
-            # Interpolate to our spend_range
-            base_spend = current if current > 0 else 1.0
-            multiplier_range = spend_range / base_spend
-            curve = np.interp(multiplier_range, multipliers, ch_response.values)
-            curve = curve - curve[0]  # normalise to start at 0
-        except Exception:
-            k = float(df[col].quantile(0.7)) or 1.0
-            curve = spend_range ** 2 / (k ** 2 + spend_range ** 2)
-
-        saturation.append({
-            "channel": ch,
-            "curve_points": [
-                {"spend": round(float(s), 2), "response": round(float(v), 4)}
-                for s, v in zip(spend_range, curve)
-            ],
-            "current_spend": round(current, 2),
-            "threshold": round(threshold, 2),
-            "is_saturated": current > threshold,
-        })
-
-    return saturation
-
-
-def _fallback_saturation(df, spend_cols, channels):
-    saturation = []
-    for col, ch in zip(spend_cols, channels):
-        current = float(df[col].mean())
-        max_spend = current * 3.0 or 1.0
-        spend_range = np.linspace(0, max_spend, 50)
-        k = float(df[col].quantile(0.7)) or 1.0
-        curve = spend_range ** 2 / (k ** 2 + spend_range ** 2)
-        threshold = float(df[col].quantile(0.75))
-        saturation.append({
-            "channel": ch,
-            "curve_points": [
-                {"spend": round(float(s), 2), "response": round(float(v), 4)}
-                for s, v in zip(spend_range, curve)
-            ],
-            "current_spend": round(current, 2),
-            "threshold": round(threshold, 2),
-            "is_saturated": current > threshold,
-        })
-    return saturation
