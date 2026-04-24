@@ -11,6 +11,7 @@ python-multipart==0.0.9
 pydantic>=2.9.0
 pydantic-settings>=2.4.0
 # MMM model libraries
-pymc-marketing==0.10.0
+pymc>=5.15
+pytensor>=2.25
 google-meridian
 scipy

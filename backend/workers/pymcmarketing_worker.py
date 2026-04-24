@@ -1,9 +1,8 @@
 from __future__ import annotations
 """
-PyMC-Marketing MMM worker.
-Runs a Bayesian MMM with adstock + saturation transformations.
-Produces channel contributions, saturation curves, and posterior-based
-confidence intervals for recommendations.
+PyMC MMM worker.
+Implements Bayesian MMM directly with PyMC — geometric adstock +
+logistic saturation — without the pymc-marketing wrapper.
 """
 import uuid
 import traceback
@@ -60,23 +59,18 @@ def run_pymc(job_id: str):
         job.status = "running"
         db.commit()
 
-        # Load & aggregate data
         config = job.config or {}
         df = pd.read_csv(config["file_path"])
         grain = config.get("grain", {"time": "weekly", "dimensions": ["channel", "geo"]})
-        agg_df = aggregate(df, grain)
-
-        # If channel is in grain dims, data is long format — pivot to wide
-        agg_df = _ensure_wide(agg_df)
-
-        # Seasonality features
-        season_config = config.get("seasonality", {"dow": True, "countries": []})
-        season_feats = build_seasonality_features(agg_df["date"], season_config)
+        agg_df = _ensure_wide(aggregate(df, grain))
 
         spend_cols = [c for c in agg_df.columns if c.startswith("spend_")]
         channels = [c.replace("spend_", "") for c in spend_cols]
+        agg_df = agg_df.groupby("date")[spend_cols + ["ftbs"]].sum().reset_index()
 
-        # Run PyMC-Marketing MMM
+        season_config = config.get("seasonality", {"dow": True, "countries": []})
+        season_feats = build_seasonality_features(agg_df["date"], season_config)
+
         model_results = _fit_pymc_mmm(agg_df, spend_cols, channels, season_feats, config)
 
         result.status = "completed"
@@ -84,7 +78,7 @@ def run_pymc(job_id: str):
         result.contributions = _jsonify(model_results["contributions"])
         result.saturation = _jsonify(model_results["saturation"])
         result.decomposition = _jsonify(model_results["decomposition"])
-        result.raw_output = {"model": "pymc-marketing", "version": "0.8.0"}
+        result.raw_output = {"model": "pymc", "version": "5.x"}
 
         _update_job_status(db, job)
         db.commit()
@@ -100,6 +94,16 @@ def run_pymc(job_id: str):
         db.close()
 
 
+def _geometric_adstock_numpy(spend: np.ndarray, alpha: float, l_max: int = 8) -> np.ndarray:
+    """Apply geometric adstock decay to a spend array (numpy, for preprocessing)."""
+    n = len(spend)
+    result = np.zeros(n)
+    for t in range(n):
+        for l in range(min(l_max, t + 1)):
+            result[t] += (alpha ** l) * spend[t - l]
+    return result
+
+
 def _fit_pymc_mmm(
     df: pd.DataFrame,
     spend_cols: list[str],
@@ -108,109 +112,108 @@ def _fit_pymc_mmm(
     config: dict,
 ) -> dict:
     try:
-        from pymc_marketing.mmm import MMM, GeometricAdstock, LogisticSaturation
+        import pymc as pm
+        import pytensor.tensor as pt
 
-        # PyMC-Marketing requires one row per date — collapse any remaining dims
-        X = df.groupby("date")[spend_cols].sum().reset_index()
-        y_series = df.groupby("date")["ftbs"].sum().reset_index()["ftbs"]
-        y = y_series.values.astype(float)
+        y = df["ftbs"].values.astype(float)
+        y_mean = float(y.mean())
+        y_std = float(y.std()) or 1.0
+        n_channels = len(spend_cols)
+        l_max = config.get("adstock_max_lag", 8)
 
-        control_cols = None
+        # Pre-apply geometric adstock with fixed alpha=0.5 as starting point.
+        # PyMC will estimate the channel betas; adstock decay is approximated.
+        X_raw = df[spend_cols].values.astype(float)  # (T, C)
+        X_adstocked = np.column_stack([
+            _geometric_adstock_numpy(X_raw[:, i], alpha=0.5, l_max=l_max)
+            for i in range(n_channels)
+        ])
+
+        # Normalise spend per channel (0-1) for better sampling
+        X_max = X_adstocked.max(axis=0)
+        X_max[X_max == 0] = 1.0
+        X_norm = X_adstocked / X_max
+
+        # Seasonality controls
+        X_controls = None
         if not season_feats.empty:
-            X = X.merge(season_feats.reset_index(), on="date", how="left").fillna(0)
-            control_cols = list(season_feats.columns)
+            sf = season_feats.reset_index()
+            sf["date"] = pd.to_datetime(sf["date"])
+            df2 = df.copy()
+            df2["date"] = pd.to_datetime(df2["date"])
+            merged = df2[["date"]].merge(sf, on="date", how="left").fillna(0)
+            ctrl_cols = [c for c in merged.columns if c != "date"]
+            X_controls = merged[ctrl_cols].values.astype(float)
 
-        mmm = MMM(
-            adstock=GeometricAdstock(l_max=config.get("adstock_max_lag", 8)),
-            saturation=LogisticSaturation(),
-            date_column="date",
-            channel_columns=spend_cols,
-            control_columns=control_cols,
-        )
+        with pm.Model() as model:
+            # Logistic saturation: response = 1 - exp(-lam * x)
+            lam = pm.HalfNormal("lam", sigma=1.0, shape=n_channels)
+            X_sat = 1.0 - pm.math.exp(-lam[None, :] * pt.as_tensor_variable(X_norm))
 
-        mmm.fit(
-            X=X,
-            y=y,
-            draws=config.get("draws", 500),
-            tune=config.get("tune", 200),
-            chains=2,
-            target_accept=0.9,
-            random_seed=42,
-            progressbar=False,
-        )
+            # Channel contribution coefficients
+            beta = pm.HalfNormal("beta", sigma=y_std, shape=n_channels)
 
-        return _extract_pymc_results(mmm, df, spend_cols, channels)
+            # Baseline
+            baseline = pm.Normal("baseline", mu=y_mean * 0.4, sigma=y_std)
+
+            # Seasonality
+            if X_controls is not None and X_controls.shape[1] > 0:
+                gamma = pm.Normal("gamma", mu=0, sigma=y_std * 0.1, shape=X_controls.shape[1])
+                mu = baseline + pm.math.dot(X_sat, beta) + pm.math.dot(
+                    pt.as_tensor_variable(X_controls), gamma
+                )
+            else:
+                mu = baseline + pm.math.dot(X_sat, beta)
+
+            sigma = pm.HalfNormal("sigma", sigma=y_std)
+            pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y)
+
+            idata = pm.sample(
+                draws=config.get("draws", 500),
+                tune=config.get("tune", 200),
+                chains=config.get("chains", 2),
+                target_accept=0.9,
+                random_seed=42,
+                progressbar=False,
+            )
+
+        return _extract_results(idata, df, spend_cols, channels, X_norm, X_max, y)
 
     except ImportError:
         return _synthetic_results(df, spend_cols, channels, model_name="pymc")
 
 
-def _extract_pymc_results(mmm, df, spend_cols, channels):
-    try:
-        # Channel contributions (shape: chain x draw x date x channel)
-        contrib_da = mmm.compute_channel_contribution_original_scale()
-        total_by_channel = contrib_da.sum("date").mean(["chain", "draw"])
-        total_ftbs = float(df["ftbs"].sum())
+def _extract_results(idata, df, spend_cols, channels, X_norm, X_max, y):
+    posterior = idata.posterior
 
-        contributions = []
-        for col, ch in zip(spend_cols, channels):
-            try:
-                contrib_val = float(total_by_channel.sel(channel=col).values)
-            except Exception:
-                contrib_val = float(total_by_channel.isel(channel=spend_cols.index(col)).values)
-            spend = float(df[col].sum())
-            contributions.append({
-                "channel": ch,
-                "contribution_pct": round(contrib_val / max(total_ftbs, 1) * 100, 2),
-                "spend": round(spend, 2),
-                "roi": round(contrib_val / max(spend, 1), 4),
-            })
-    except Exception:
-        return _synthetic_results(df, spend_cols, channels, model_name="pymc")
+    # Posterior means
+    lam_mean = posterior["lam"].mean(dim=["chain", "draw"]).values   # (C,)
+    beta_mean = posterior["beta"].mean(dim=["chain", "draw"]).values  # (C,)
 
-    saturation = _extract_saturation_curves(mmm, df, spend_cols, channels)
-
-    # Fitted values for metrics
-    try:
-        y_pred = mmm.idata.posterior_predictive["y"].mean(["chain", "draw"]).values
-    except Exception:
-        y_pred = np.full(len(df), df["ftbs"].mean())
-    metrics = _compute_metrics(df["ftbs"].values, y_pred)
-
-    decomposition = _build_decomposition(df, contributions)
-
-    return {
-        "metrics": metrics,
-        "contributions": contributions,
-        "saturation": saturation,
-        "decomposition": decomposition,
-    }
-
-
-def _extract_saturation_curves(mmm, df, spend_cols, channels):
-    saturation = []
-    posterior = mmm.idata.posterior
-
+    # Channel contributions: beta * mean(saturation(x))
+    total_ftbs = float(y.sum())
+    contributions = []
     for i, (col, ch) in enumerate(zip(spend_cols, channels)):
-        max_spend = float(df[col].max()) * 1.5 or 1.0
-        spend_range = np.linspace(0, max_spend, 50)
+        sat_mean = float(np.mean(1 - np.exp(-lam_mean[i] * X_norm[:, i])))
+        contrib = float(beta_mean[i]) * sat_mean * len(df)
+        spend = float(df[col].sum())
+        contributions.append({
+            "channel": ch,
+            "contribution_pct": round(contrib / max(total_ftbs, 1) * 100, 2),
+            "spend": round(spend, 2),
+            "roi": round(contrib / max(spend, 1), 4),
+        })
 
-        try:
-            # LogisticSaturation uses lam parameter; beta scales input
-            # Variable names: saturation_lam, saturation_beta (per channel)
-            lam = float(posterior["saturation_lam"].isel(channel=i).mean(["chain", "draw"]).values)
-            beta = float(posterior["saturation_beta"].isel(channel=i).mean(["chain", "draw"]).values)
-            curve = lam / (1.0 + np.exp(-beta * spend_range))
-            # Normalise so curve starts at 0
-            curve = curve - curve[0]
-        except Exception:
-            # Fallback: Hill-style curve from spend stats
-            k = float(df[col].quantile(0.7)) or 1.0
-            curve = spend_range ** 2 / (k ** 2 + spend_range ** 2)
-
+    # Saturation curves
+    saturation = []
+    for i, (col, ch) in enumerate(zip(spend_cols, channels)):
+        max_raw = float(df[col].max()) * 1.5 or 1.0
+        spend_range = np.linspace(0, max_raw, 50)
+        # Normalise same way as training data
+        x_norm_range = spend_range / X_max[i]
+        curve = 1 - np.exp(-lam_mean[i] * x_norm_range)
         current = float(df[col].mean())
         threshold = float(df[col].quantile(0.75))
-
         saturation.append({
             "channel": ch,
             "curve_points": [
@@ -222,17 +225,31 @@ def _extract_saturation_curves(mmm, df, spend_cols, channels):
             "is_saturated": current > threshold,
         })
 
-    return saturation
+    # Metrics
+    baseline_mean = float(posterior["baseline"].mean(dim=["chain", "draw"]).values)
+    y_pred = np.array([
+        baseline_mean + sum(
+            beta_mean[i] * (1 - np.exp(-lam_mean[i] * X_norm[t, i]))
+            for i in range(len(spend_cols))
+        )
+        for t in range(len(df))
+    ])
+    metrics = _compute_metrics(y, y_pred)
+    decomposition = _build_decomposition(df, contributions)
+
+    return {
+        "metrics": metrics,
+        "contributions": contributions,
+        "saturation": saturation,
+        "decomposition": decomposition,
+    }
 
 
 def _synthetic_results(df: pd.DataFrame, spend_cols: list, channels: list, model_name: str) -> dict:
-    """Realistic synthetic results used when the model library isn't installed."""
+    """Realistic synthetic results used when PyMC is not installed."""
     np.random.seed({"pymc": 1, "robyn": 2, "meridian": 3}.get(model_name, 0))
 
     total_spend = {col: df[col].sum() for col in spend_cols}
-    total_all = sum(total_spend.values()) or 1
-
-    # ROI varies by channel with some model-specific noise
     base_roi = {
         "facebook": 3.1, "google": 4.2, "tiktok": 2.8, "youtube": 2.3,
         "applesearch": 4.8, "snapchat": 2.1, "pinterest": 1.9, "twitter": 1.5,
@@ -244,54 +261,41 @@ def _synthetic_results(df: pd.DataFrame, spend_cols: list, channels: list, model
 
     for col, ch in zip(spend_cols, channels):
         spend = total_spend[col]
-        ch_key = ch.lower().replace(" ", "")
-        roi = base_roi.get(ch_key, 2.5) * np.random.uniform(0.85, 1.15)
+        roi = base_roi.get(ch.lower().replace(" ", ""), 2.5) * np.random.uniform(0.85, 1.15)
         contrib = spend * roi * np.random.uniform(0.9, 1.1)
         total_contrib += contrib
 
         max_spend = df[col].max()
-        spend_range = np.linspace(0, max_spend * 1.5, 50).tolist()
-        k = max_spend * np.random.uniform(0.5, 0.9)  # saturation point
-        curve = [s ** 2 / (k ** 2 + s ** 2) for s in spend_range]
-
+        spend_range = np.linspace(0, max_spend * 1.5, 50)
+        k = max_spend * np.random.uniform(0.5, 0.9)
+        curve = spend_range ** 2 / (k ** 2 + spend_range ** 2)
         current = float(df[col].mean())
         threshold = k * 0.8
 
         contributions.append({
-            "channel": ch,
-            "spend": round(spend, 2),
-            "roi": round(roi, 3),
-            "_raw_contrib": contrib,
-            "contribution_pct": 0,  # filled after normalization
+            "channel": ch, "spend": round(spend, 2),
+            "roi": round(roi, 3), "_raw_contrib": contrib, "contribution_pct": 0,
         })
         saturation.append({
             "channel": ch,
-            "curve_points": [
-                {"spend": round(s, 2), "response": round(v, 4)}
-                for s, v in zip(spend_range, curve)
-            ],
+            "curve_points": [{"spend": round(float(s), 2), "response": round(float(v), 4)} for s, v in zip(spend_range, curve)],
             "current_spend": round(current, 2),
             "threshold": round(threshold, 2),
             "is_saturated": current > threshold,
         })
 
-    # Normalize contributions
     for c in contributions:
         c["contribution_pct"] = round(c.pop("_raw_contrib") / max(total_contrib, 1) * 100, 2)
 
-    # Metrics
     y_true = df["ftbs"].values
     noise_factor = {"pymc": 0.92, "robyn": 0.89, "meridian": 0.90}.get(model_name, 0.90)
     y_pred = y_true * noise_factor + np.random.normal(0, y_true.std() * 0.1, len(y_true))
-    metrics = _compute_metrics(y_true, y_pred)
-
-    decomposition = _build_decomposition(df, contributions)
 
     return {
-        "metrics": metrics,
+        "metrics": _compute_metrics(y_true, y_pred),
         "contributions": contributions,
         "saturation": saturation,
-        "decomposition": decomposition,
+        "decomposition": _build_decomposition(df, contributions),
     }
 
 
@@ -307,7 +311,6 @@ def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
 
 
 def _jsonify(obj):
-    """Recursively convert numpy/pandas scalars to Python native types."""
     if isinstance(obj, dict):
         return {k: _jsonify(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -325,14 +328,11 @@ def _jsonify(obj):
 
 def _build_decomposition(df: pd.DataFrame, contributions: list[dict]) -> list[dict]:
     dates = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d").tolist() if "date" in df.columns else []
-    n = len(dates)
     result = []
     for i, date in enumerate(dates):
         row: dict = {"date": date, "baseline": round(float(df["ftbs"].iloc[i]) * 0.35, 1)}
         for c in contributions:
-            row[c["channel"]] = round(
-                float(df["ftbs"].iloc[i]) * c["contribution_pct"] / 100, 1
-            )
+            row[c["channel"]] = round(float(df["ftbs"].iloc[i]) * c["contribution_pct"] / 100, 1)
         result.append(row)
     return result
 
