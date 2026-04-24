@@ -82,7 +82,8 @@ OutputCollect <- robyn_outputs(
 # Pick best solution (lowest NRMSE on Pareto front)
 hyp_df  <- as.data.frame(OutputModels$resultHypParam)
 pareto_ids <- OutputCollect$allSolutions
-best_id <- pareto_ids[which.min(hyp_df[hyp_df$solID %in% pareto_ids, "nrmse"])]
+pareto_hyps <- hyp_df[hyp_df$solID %in% pareto_ids, ]
+best_id <- pareto_hyps$solID[which.min(pareto_hyps$nrmse)]
 
 cat("[Robyn] Best solution:", best_id, "\n")
 

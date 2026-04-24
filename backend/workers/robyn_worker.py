@@ -13,7 +13,6 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from core.database import SessionLocal
@@ -116,6 +115,9 @@ def _fit_robyn(df: pd.DataFrame, spend_cols: list, channels: list, config: dict)
         if proc.returncode != 0:
             raise RuntimeError(f"Robyn R script failed (exit {proc.returncode}):\n{proc.stderr[-2000:]}")
 
+        if not os.path.exists(output_path):
+            raise RuntimeError("R script completed but did not produce output file")
+
         with open(output_path) as f:
             raw = json.load(f)
 
@@ -129,11 +131,8 @@ def _normalise_output(raw: dict, df: pd.DataFrame, spend_cols: list, channels: l
     metrics       = raw.get("metrics", {})
     decomposition = raw.get("decomposition", [])
 
-    # Ensure contribution_pct sums to ~100
-    total_pct = sum(c.get("contribution_pct", 0) for c in contributions)
-    if total_pct > 0:
-        for c in contributions:
-            c["contribution_pct"] = round(c["contribution_pct"] / total_pct * 100, 2)
+    # Note: contribution_pct from Robyn represents share of media-attributed
+    # conversions (excludes baseline). Values may not sum to 100.
 
     return {
         "metrics": {
@@ -157,11 +156,5 @@ def _r_available() -> bool:
 
 def _find_python() -> str:
     """Return path to the Python that has nevergrad installed."""
-    for candidate in [
-        "/usr/local/bin/python3",
-        "/usr/bin/python3",
-        "/usr/local/bin/python",
-    ]:
-        if os.path.exists(candidate):
-            return candidate
-    return "python3"
+    import sys
+    return sys.executable

@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential libpq-dev libopenblas-dev gfortran pkg-config \
     r-base r-base-dev \
     libcurl4-openssl-dev libssl-dev libxml2-dev \
-    libharfbuzz-dev libfribidi-dev libnlopt-dev \
+    libharfbuzz-dev libfribidi-dev libnlopt-dev libgit2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install R packages — Robyn + runtime deps
