@@ -9,14 +9,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libharfbuzz-dev libfribidi-dev libnlopt-dev libgit2-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Cache bust — increment to force full rebuild of R + pip layers
+ARG CACHE_BUST=7
+
 # Install R packages — Robyn + runtime deps
-# Try CRAN first, fall back to GitHub if needed, then verify
 RUN R -e "install.packages(c('jsonlite','data.table','reticulate','remotes'), repos='https://cran.r-project.org', dependencies=TRUE)" \
     && R -e "tryCatch(install.packages('Robyn', repos='https://cran.r-project.org', dependencies=TRUE), error=function(e) remotes::install_github('facebookexperimental/Robyn', subdir='R', dependencies=TRUE))" \
     && R -e "library(Robyn); cat('Robyn version:', as.character(packageVersion('Robyn')), '\n')"
 
 COPY requirements.txt .
-ARG CACHE_BUST=6
 RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
 COPY . .
