@@ -1,31 +1,28 @@
 from __future__ import annotations
 """
-Robyn (Meta) MMM worker.
-Calls an R subprocess (robyn_runner.R) via Rscript.
-Falls back to synthetic results if R/Robyn is not installed.
+Robyn-style MMM worker.
+Implements Meta Robyn's methodology in Python:
+geometric adstock + Hill saturation + nevergrad multi-objective optimization.
 """
-import json
-import os
-import subprocess
-import tempfile
 import traceback
 import uuid
 from datetime import datetime
-from pathlib import Path
 
+import numpy as np
 import pandas as pd
+import nevergrad as ng
 
 from core.database import SessionLocal
 from models.db import Job, Result
 from services.aggregator import aggregate
+from services.seasonality import build_seasonality_features
 from workers.pymcmarketing_worker import (
     _ensure_wide,
-    _synthetic_results,
     _update_job_status,
     _jsonify,
+    _compute_metrics,
+    _build_decomposition,
 )
-
-ROBYN_SCRIPT = Path(__file__).parent / "robyn_runner.R"
 
 
 def run_robyn(job_id: str):
@@ -53,14 +50,17 @@ def run_robyn(job_id: str):
         channels = [c.replace("spend_", "") for c in spend_cols]
         agg_df = agg_df.groupby("date")[spend_cols + ["ftbs"]].sum().reset_index()
 
-        model_results = _fit_robyn(agg_df, spend_cols, channels, config)
+        season_config = config.get("seasonality", {"dow": True, "countries": []})
+        season_feats = build_seasonality_features(agg_df["date"], season_config)
+
+        model_results = _fit_robyn(agg_df, spend_cols, channels, season_feats, config)
 
         result.status = "completed"
         result.metrics = _jsonify(model_results["metrics"])
         result.contributions = _jsonify(model_results["contributions"])
         result.saturation = _jsonify(model_results["saturation"])
         result.decomposition = _jsonify(model_results["decomposition"])
-        result.raw_output = {"model": "robyn", "version": "3.x"}
+        result.raw_output = {"model": "robyn-lightweight", "version": "1.0"}
 
         _update_job_status(db, job)
         db.commit()
@@ -76,89 +76,171 @@ def run_robyn(job_id: str):
         db.close()
 
 
-def _fit_robyn(df: pd.DataFrame, spend_cols: list, channels: list, config: dict) -> dict:
-    if not _r_available():
-        return _synthetic_results(df, spend_cols, channels, model_name="robyn")
+# ── Geometric adstock (Robyn's default) ─────────────────────────────────────
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        data_path   = os.path.join(tmpdir, "data.csv")
-        config_path = os.path.join(tmpdir, "config.json")
-        output_path = os.path.join(tmpdir, "output.json")
-
-        df.to_csv(data_path, index=False)
-
-        robyn_config = {
-            "spend_cols": spend_cols,
-            "channels": channels,
-            "iterations": config.get("draws", 200),
-            "trials": 1,
-        }
-        with open(config_path, "w") as f:
-            json.dump(robyn_config, f)
-
-        env = os.environ.copy()
-        env["RETICULATE_PYTHON"] = _find_python()
-
-        proc = subprocess.run(
-            ["Rscript", "--vanilla", str(ROBYN_SCRIPT), data_path, config_path, output_path],
-            capture_output=True,
-            text=True,
-            timeout=3600,  # 1 hour max
-            env=env,
-        )
-
-        if proc.stdout:
-            print(proc.stdout)
-        if proc.stderr:
-            print(proc.stderr)
-
-        if proc.returncode != 0:
-            raise RuntimeError(f"Robyn R script failed (exit {proc.returncode}):\n{proc.stderr[-2000:]}")
-
-        if not os.path.exists(output_path):
-            raise RuntimeError("R script completed but did not produce output file")
-
-        with open(output_path) as f:
-            raw = json.load(f)
-
-    return _normalise_output(raw, df, spend_cols, channels)
+def _geometric_adstock(spend: np.ndarray, theta: float, l_max: int = 8) -> np.ndarray:
+    """Geometric adstock: exponential decay with rate theta (0-1)."""
+    n = len(spend)
+    result = np.zeros(n)
+    for t in range(n):
+        for lag in range(min(l_max, t + 1)):
+            result[t] += (theta ** lag) * spend[t - lag]
+    return result
 
 
-def _normalise_output(raw: dict, df: pd.DataFrame, spend_cols: list, channels: list) -> dict:
-    """Ensure output matches the standard result schema."""
-    contributions = raw.get("contributions", [])
-    saturation    = raw.get("saturation", [])
-    metrics       = raw.get("metrics", {})
-    decomposition = raw.get("decomposition", [])
+# ── Hill saturation (Robyn's default) ───────────────────────────────────────
 
-    # Note: contribution_pct from Robyn represents share of media-attributed
-    # conversions (excludes baseline). Values may not sum to 100.
+def _hill_saturation(x: np.ndarray, alpha: float, gamma: float) -> np.ndarray:
+    """Hill function: response = x^alpha / (x^alpha + gamma^alpha).
+    Distinct from PyMC's logistic and Meridian's exponential."""
+    x_safe = np.maximum(x, 0)
+    return x_safe ** alpha / (x_safe ** alpha + gamma ** alpha + 1e-10)
+
+
+# ── Nevergrad multi-objective optimization ──────────────────────────────────
+
+def _fit_robyn(df, spend_cols, channels, season_feats, config):
+    """Robyn-style MMM: geometric adstock + Hill saturation + nevergrad
+    optimization (TwoPointsDE, matching Robyn's default optimizer)."""
+    y = df["ftbs"].values.astype(float)
+    n_channels = len(spend_cols)
+    l_max = config.get("adstock_max_lag", 8)
+    n_iter = config.get("draws", 300)
+
+    X_raw = df[spend_cols].values.astype(float)
+
+    # Seasonality controls
+    X_controls = None
+    if not season_feats.empty:
+        sf = season_feats.reset_index()
+        sf["date"] = pd.to_datetime(sf["date"])
+        df2 = df.copy()
+        df2["date"] = pd.to_datetime(df2["date"])
+        merged = df2[["date"]].merge(sf, on="date", how="left").fillna(0)
+        ctrl_cols = [c for c in merged.columns if c != "date"]
+        X_controls = merged[ctrl_cols].values.astype(float)
+
+    # ── Define parameter space ──────────────────────────────────────────────
+    # Per channel: theta (adstock decay), alpha (Hill shape), gamma (Hill half-max)
+    # Plus: intercept, channel betas, control betas
+    n_controls = X_controls.shape[1] if X_controls is not None else 0
+
+    param = ng.p.Instrumentation(
+        thetas=ng.p.Array(shape=(n_channels,)).set_bounds(0.0, 0.9),
+        alphas=ng.p.Array(shape=(n_channels,)).set_bounds(0.5, 3.0),
+        gammas=ng.p.Array(shape=(n_channels,)).set_bounds(0.1, 1.0),
+        betas=ng.p.Array(shape=(n_channels,)).set_bounds(0.0, None),
+        intercept=ng.p.Scalar().set_bounds(0.0, None),
+        ctrl_betas=ng.p.Array(shape=(max(n_controls, 1),)).set_bounds(None, None),
+    )
+
+    def loss_fn(thetas, alphas, gammas, betas, intercept, ctrl_betas):
+        """NRMSE + decomposition penalty (Robyn's DECOMP.RSSD)."""
+        # Transform spend
+        X_transformed = np.zeros_like(X_raw)
+        for i in range(n_channels):
+            adstocked = _geometric_adstock(X_raw[:, i], float(thetas[i]), l_max)
+            x_max = adstocked.max() or 1.0
+            x_norm = adstocked / x_max
+            gamma_scaled = float(gammas[i]) * x_norm.max() if x_norm.max() > 0 else 0.5
+            X_transformed[:, i] = _hill_saturation(x_norm, float(alphas[i]), gamma_scaled)
+
+        # Predict
+        y_pred = float(intercept) + X_transformed @ betas
+        if X_controls is not None and n_controls > 0:
+            y_pred = y_pred + X_controls @ ctrl_betas[:n_controls]
+
+        # NRMSE
+        residuals = y - y_pred
+        rmse = np.sqrt(np.mean(residuals ** 2))
+        y_range = y.max() - y.min()
+        nrmse = rmse / max(y_range, 1e-9)
+
+        # Decomposition concentration penalty (Robyn's DECOMP.RSSD)
+        # Penalise if one channel dominates too much
+        contribs = betas * np.array([X_transformed[:, i].mean() for i in range(n_channels)])
+        total = contribs.sum() + 1e-10
+        shares = contribs / total
+        # RSSD = root sum of squared deviations from uniform
+        uniform = 1.0 / max(n_channels, 1)
+        rssd = np.sqrt(np.mean((shares - uniform) ** 2))
+
+        return float(nrmse + 0.1 * rssd)
+
+    # ── Run optimization ────────────────────────────────────────────────────
+    optimizer = ng.optimizers.TwoPointsDE(parametrization=param, budget=n_iter, num_workers=1)
+    recommendation = optimizer.minimize(loss_fn)
+
+    # Extract best params
+    best = recommendation.kwargs
+    thetas = best["thetas"]
+    alphas = best["alphas"]
+    gammas = best["gammas"]
+    betas = best["betas"]
+    intercept_val = float(best["intercept"])
+
+    # ── Build final predictions with best params ────────────────────────────
+    X_transformed = np.zeros_like(X_raw)
+    best_params = []
+    for i in range(n_channels):
+        adstocked = _geometric_adstock(X_raw[:, i], float(thetas[i]), l_max)
+        x_max = adstocked.max() or 1.0
+        x_norm = adstocked / x_max
+        gamma_scaled = float(gammas[i]) * x_norm.max() if x_norm.max() > 0 else 0.5
+        X_transformed[:, i] = _hill_saturation(x_norm, float(alphas[i]), gamma_scaled)
+        best_params.append({
+            "theta": round(float(thetas[i]), 4),
+            "alpha": round(float(alphas[i]), 4),
+            "gamma": round(float(gammas[i]), 4),
+            "gamma_scaled": round(gamma_scaled, 4),
+            "x_max": x_max,
+        })
+
+    y_pred = intercept_val + X_transformed @ betas
+    if X_controls is not None and n_controls > 0:
+        y_pred = y_pred + X_controls @ best["ctrl_betas"][:n_controls]
+
+    # ── Channel contributions ───────────────────────────────────────────────
+    total_ftbs = float(y.sum())
+    contributions = []
+    for i, (col, ch) in enumerate(zip(spend_cols, channels)):
+        contrib = float((betas[i] * X_transformed[:, i]).sum())
+        spend = float(df[col].sum())
+        contributions.append({
+            "channel": ch,
+            "contribution_pct": round(contrib / max(total_ftbs, 1) * 100, 2),
+            "spend": round(spend, 2),
+            "roi": round(contrib / max(spend, 1), 4),
+        })
+
+    # ── Saturation curves (Hill, distinct from exponential/logistic) ────────
+    saturation = []
+    for i, (col, ch) in enumerate(zip(spend_cols, channels)):
+        p = best_params[i]
+        max_raw = max(float(df[col].max()) * 1.5, 1.0)
+        spend_range = np.linspace(0, max_raw, 50)
+        x_norm = spend_range / p["x_max"]
+        curve = _hill_saturation(x_norm, p["alpha"], p["gamma_scaled"])
+
+        current = float(df[col].mean())
+        threshold = float(df[col].quantile(0.75))
+        saturation.append({
+            "channel": ch,
+            "curve_points": [
+                {"spend": round(float(s), 2), "response": round(float(v), 4)}
+                for s, v in zip(spend_range, curve)
+            ],
+            "current_spend": round(current, 2),
+            "threshold": round(threshold, 2),
+            "is_saturated": current > threshold,
+        })
+
+    metrics = _compute_metrics(y, y_pred)
+    decomposition = _build_decomposition(df, contributions)
 
     return {
-        "metrics": {
-            "r2":    float(metrics.get("r2", 0)),
-            "mape":  float(metrics.get("mape", 0)),
-            "nrmse": float(metrics.get("nrmse", 0)),
-        },
+        "metrics": metrics,
         "contributions": contributions,
-        "saturation":    saturation,
+        "saturation": saturation,
         "decomposition": decomposition,
     }
-
-
-def _r_available() -> bool:
-    """Check that both Rscript and the Robyn package are installed."""
-    try:
-        r = subprocess.run(
-            ["Rscript", "-e", "library(Robyn)"],
-            capture_output=True, timeout=30,
-        )
-        return r.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
-
-
-def _find_python() -> str:
-    """Return path to the Python that has nevergrad installed."""
-    import sys
-    return sys.executable
