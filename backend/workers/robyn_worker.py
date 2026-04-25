@@ -105,7 +105,7 @@ def _fit_robyn(df, spend_cols, channels, season_feats, config):
     y = df["ftbs"].values.astype(float)
     n_channels = len(spend_cols)
     l_max = config.get("adstock_max_lag", 8)
-    n_iter = config.get("draws", 300)
+    n_iter = config.get("draws", 2000)
 
     X_raw = df[spend_cols].values.astype(float)
 
@@ -126,15 +126,19 @@ def _fit_robyn(df, spend_cols, channels, season_feats, config):
     n_controls = X_controls.shape[1] if X_controls is not None else 0
 
     # Init arrays with values inside bounds before setting bounds
+    y_mean = float(y.mean())
+
     thetas_p = ng.p.Array(init=np.full(n_channels, 0.3))
     thetas_p.set_bounds(0.0, 0.9)
     alphas_p = ng.p.Array(init=np.full(n_channels, 1.5))
     alphas_p.set_bounds(0.5, 3.0)
     gammas_p = ng.p.Array(init=np.full(n_channels, 0.5))
     gammas_p.set_bounds(0.1, 1.0)
-    betas_p = ng.p.Array(init=np.full(n_channels, 1.0))
+    # Scale betas relative to y — each channel starts with equal share
+    beta_init = y_mean * 0.6 / max(n_channels, 1)
+    betas_p = ng.p.Array(init=np.full(n_channels, beta_init))
     betas_p.set_bounds(0.0, None)
-    intercept_p = ng.p.Scalar(init=float(y.mean() * 0.4))
+    intercept_p = ng.p.Scalar(init=y_mean * 0.4)
     intercept_p.set_bounds(0.0, None)
     ctrl_p = ng.p.Array(init=np.zeros(max(n_controls, 1)))
 
