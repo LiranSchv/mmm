@@ -1,10 +1,12 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import { Providers } from "./providers";
+import { NavBar } from "@/components/layout/NavBar";
 
 export const metadata: Metadata = {
-  title: "MMM Platform",
-  description: "Marketing Mix Modeling — compare Robyn, Meridian & PyMC",
+  title: "MMM Platform — Marketing Mix Modeling",
+  description:
+    "Run Robyn, Meridian & PyMC side-by-side to optimize your marketing spend. Get channel attribution, saturation curves, and budget recommendations.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -12,14 +14,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en">
       <body>
         <Providers>
-          <header className="border-b border-gray-200 bg-white">
-            <div className="mx-auto max-w-7xl px-6 py-4 flex items-center gap-3">
-              <span className="text-lg font-bold text-brand">MMM Platform</span>
-              <span className="text-gray-300">|</span>
-              <span className="text-sm text-gray-500">Robyn · Meridian · PyMC-Marketing</span>
-            </div>
-          </header>
-          <main className="mx-auto max-w-7xl px-6 py-8">{children}</main>
+          <NavBar />
+          <div id="app-content">{children}</div>
         </Providers>
       </body>
     </html>

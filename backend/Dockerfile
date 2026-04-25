@@ -10,10 +10,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install R packages — Robyn + runtime deps
-RUN R -e "install.packages(c('Robyn','jsonlite','data.table','reticulate'), repos='https://cran.r-project.org', quiet=TRUE)"
+# Install dependencies first, then Robyn from CRAN with verbose output to catch errors
+RUN R -e "install.packages(c('jsonlite','data.table','reticulate'), repos='https://cran.r-project.org', dependencies=TRUE)" \
+    && R -e "install.packages('remotes', repos='https://cran.r-project.org')" \
+    && R -e "remotes::install_github('facebookexperimental/Robyn/R', dependencies=TRUE, upgrade='never')"
 
 COPY requirements.txt .
-ARG CACHE_BUST=5
+ARG CACHE_BUST=6
 RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
 COPY . .
