@@ -168,14 +168,27 @@ def _fit_pymc_mmm(
             sigma = pm.HalfNormal("sigma", sigma=y_std)
             pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y)
 
-            idata = pm.sample(
-                draws=config.get("draws", 500),
-                tune=config.get("tune", 200),
-                chains=config.get("chains", 2),
-                target_accept=0.9,
-                random_seed=42,
-                progressbar=False,
-            )
+            # Use ADVI (variational inference) for speed, with NUTS fallback
+            method = config.get("inference", "advi")
+            if method == "nuts":
+                idata = pm.sample(
+                    draws=config.get("draws", 500),
+                    tune=config.get("tune", 200),
+                    chains=config.get("chains", 2),
+                    target_accept=0.9,
+                    random_seed=42,
+                    progressbar=False,
+                )
+            else:
+                # ADVI: ~10x faster, good enough for channel attribution
+                approx = pm.fit(
+                    n=config.get("advi_iter", 30000),
+                    method="advi",
+                    random_seed=42,
+                    progressbar=False,
+                    callbacks=[pm.callbacks.CheckParametersConvergence()],
+                )
+                idata = approx.sample(draws=config.get("draws", 1000))
 
         return _extract_results(idata, df, spend_cols, channels, X_norm, X_max, y)
 
