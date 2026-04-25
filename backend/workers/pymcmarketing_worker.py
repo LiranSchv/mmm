@@ -182,11 +182,10 @@ def _fit_pymc_mmm(
             else:
                 # ADVI: ~10x faster, good enough for channel attribution
                 approx = pm.fit(
-                    n=config.get("advi_iter", 30000),
+                    n=config.get("advi_iter", 10000),
                     method="advi",
                     random_seed=42,
                     progressbar=False,
-                    callbacks=[pm.callbacks.CheckParametersConvergence()],
                 )
                 idata = approx.sample(draws=config.get("draws", 1000))
 
