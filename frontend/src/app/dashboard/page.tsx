@@ -25,9 +25,10 @@ export default function DashboardPage() {
     setError(null);
     try {
       const data = await uploadDataset(file);
-      setWarnings(data.validation_warnings ?? []);
+      const w = data.validation_warnings ?? [];
+      setWarnings(w);
       // Small delay so user sees alerts, then navigate
-      setTimeout(() => router.push(`/datasets/${data.id}`), warnings.length ? 1500 : 300);
+      setTimeout(() => router.push(`/datasets/${data.id}`), w.length ? 1500 : 300);
     } catch (e: any) {
       setError(e.message);
     } finally {

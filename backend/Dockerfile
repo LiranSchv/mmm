@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install R packages — Robyn + runtime deps
-# Install dependencies first, then Robyn from CRAN with verbose output to catch errors
+# Install dependencies first, then Robyn from GitHub repo
 RUN R -e "install.packages(c('jsonlite','data.table','reticulate'), repos='https://cran.r-project.org', dependencies=TRUE)" \
     && R -e "install.packages('remotes', repos='https://cran.r-project.org')" \
     && R -e "remotes::install_github('facebookexperimental/Robyn/R', dependencies=TRUE, upgrade='never')"
