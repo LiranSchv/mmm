@@ -147,8 +147,12 @@ def _normalise_output(raw: dict, df: pd.DataFrame, spend_cols: list, channels: l
 
 
 def _r_available() -> bool:
+    """Check that both Rscript and the Robyn package are installed."""
     try:
-        r = subprocess.run(["Rscript", "--version"], capture_output=True, timeout=10)
+        r = subprocess.run(
+            ["Rscript", "-e", "library(Robyn)"],
+            capture_output=True, timeout=30,
+        )
         return r.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
