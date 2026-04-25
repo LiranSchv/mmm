@@ -125,13 +125,26 @@ def _fit_robyn(df, spend_cols, channels, season_feats, config):
     # Plus: intercept, channel betas, control betas
     n_controls = X_controls.shape[1] if X_controls is not None else 0
 
+    # Init arrays with values inside bounds before setting bounds
+    thetas_p = ng.p.Array(init=np.full(n_channels, 0.3))
+    thetas_p.set_bounds(0.0, 0.9)
+    alphas_p = ng.p.Array(init=np.full(n_channels, 1.5))
+    alphas_p.set_bounds(0.5, 3.0)
+    gammas_p = ng.p.Array(init=np.full(n_channels, 0.5))
+    gammas_p.set_bounds(0.1, 1.0)
+    betas_p = ng.p.Array(init=np.full(n_channels, 1.0))
+    betas_p.set_bounds(0.0, None)
+    intercept_p = ng.p.Scalar(init=float(y.mean() * 0.4))
+    intercept_p.set_bounds(0.0, None)
+    ctrl_p = ng.p.Array(init=np.zeros(max(n_controls, 1)))
+
     param = ng.p.Instrumentation(
-        thetas=ng.p.Array(shape=(n_channels,)).set_bounds(0.0, 0.9),
-        alphas=ng.p.Array(shape=(n_channels,)).set_bounds(0.5, 3.0),
-        gammas=ng.p.Array(shape=(n_channels,)).set_bounds(0.1, 1.0),
-        betas=ng.p.Array(shape=(n_channels,)).set_bounds(0.0, None),
-        intercept=ng.p.Scalar().set_bounds(0.0, None),
-        ctrl_betas=ng.p.Array(shape=(max(n_controls, 1),)).set_bounds(None, None),
+        thetas=thetas_p,
+        alphas=alphas_p,
+        gammas=gammas_p,
+        betas=betas_p,
+        intercept=intercept_p,
+        ctrl_betas=ctrl_p,
     )
 
     def loss_fn(thetas, alphas, gammas, betas, intercept, ctrl_betas):
