@@ -12,7 +12,7 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import ElasticNet
 
 from core.database import SessionLocal
 from models.db import Job, Result
@@ -107,16 +107,14 @@ def _exponential_saturation(x: np.ndarray, rate: float) -> np.ndarray:
 
 def _fit_meridian(df, spend_cols, channels, season_feats, config):
     """Lightweight Meridian-style MMM: Weibull adstock + exponential
-    saturation + Bayesian Ridge regression."""
+    saturation + NNLS regression (non-negative least squares)."""
     y = df["ftbs"].values.astype(float)
     n_channels = len(spend_cols)
     l_max = config.get("adstock_max_lag", 8)
 
     X_raw = df[spend_cols].values.astype(float)
 
-    # Find best Weibull params per channel via grid search on correlation with y
-    # Apply saturation on raw-scale adstocked spend (not normalized to 0-1)
-    # so Ridge sees genuine magnitude differences between channels
+    # Find best Weibull adstock + saturation params per channel
     best_params = []
     X_transformed = np.zeros_like(X_raw)
 
@@ -127,28 +125,28 @@ def _fit_meridian(df, spend_cols, channels, season_feats, config):
         for shape in [0.5, 1.0, 1.5, 2.0, 3.0]:
             for scale in [1.0, 2.0, 3.0, 5.0]:
                 adstocked = _weibull_adstock(X_raw[:, i], shape, scale, l_max)
-                ad_mean = adstocked.mean() or 1.0
+                x_max = adstocked.max() or 1.0
+                x_norm = adstocked / x_max
 
-                # Rate is inverse-scaled to spend magnitude so saturation
-                # happens at a meaningful point on each channel's own scale
-                for rate_mult in [0.5, 1.0, 2.0, 3.0, 5.0]:
-                    rate = rate_mult / ad_mean
-                    saturated = _exponential_saturation(adstocked, rate)
+                for rate in [0.5, 1.0, 2.0, 3.0, 5.0]:
+                    saturated = _exponential_saturation(x_norm, rate)
                     corr = np.corrcoef(saturated, y)[0, 1]
                     if not np.isnan(corr) and corr > best_corr:
                         best_corr = corr
                         best_shape, best_scale, best_rate = shape, scale, rate
+                        best_x_max = x_max
 
         adstocked = _weibull_adstock(X_raw[:, i], best_shape, best_scale, l_max)
-        X_transformed[:, i] = _exponential_saturation(adstocked, best_rate)
+        x_max = adstocked.max() or 1.0
+        X_transformed[:, i] = _exponential_saturation(adstocked / x_max, best_rate)
 
         best_params.append({
             "shape": best_shape, "scale": best_scale,
-            "rate": best_rate, "x_max": adstocked.max() or 1.0,
+            "rate": best_rate, "x_max": x_max,
         })
 
-    # Add seasonality controls
-    X_fit = X_transformed.copy()
+    # Build seasonality controls (unconstrained — can be negative)
+    X_controls = None
     if not season_feats.empty:
         sf = season_feats.reset_index()
         sf["date"] = pd.to_datetime(sf["date"])
@@ -157,18 +155,30 @@ def _fit_meridian(df, spend_cols, channels, season_feats, config):
         merged = df2[["date"]].merge(sf, on="date", how="left").fillna(0)
         ctrl_cols = [c for c in merged.columns if c != "date"]
         X_controls = merged[ctrl_cols].values.astype(float)
-        X_fit = np.hstack([X_fit, X_controls])
 
-    # Ridge regression with non-negative coefficients
-    model = Ridge(alpha=1.0, fit_intercept=True, positive=True)
-    model.fit(X_fit, y)
-    y_pred = model.predict(X_fit)
+    # Step 1: fit controls (unconstrained) to capture seasonality
+    y_residual = y.copy()
+    if X_controls is not None and X_controls.shape[1] > 0:
+        from sklearn.linear_model import LinearRegression
+        ctrl_model = LinearRegression(fit_intercept=False)
+        ctrl_model.fit(X_controls, y)
+        y_residual = y - ctrl_model.predict(X_controls)
 
-    # Extract channel coefficients (first n_channels are media)
-    coefs = model.coef_[:n_channels]
+    # Step 2: ElasticNet on media channels only (positive=True)
+    # L1 creates sparsity, L2 handles correlation
+    model = ElasticNet(
+        alpha=0.1, l1_ratio=0.5, positive=True,
+        fit_intercept=True, max_iter=5000,
+    )
+    model.fit(X_transformed, y_residual)
+
+    coefs = model.coef_
     intercept = model.intercept_
+    y_pred = model.predict(X_transformed)
+    if X_controls is not None and X_controls.shape[1] > 0:
+        y_pred = y_pred + ctrl_model.predict(X_controls)
 
-    # Channel contributions = coef * sum(transformed_spend)
+    # Channel contributions = coef * sum(transformed_spend_i)
     total_ftbs = float(y.sum())
     contributions = []
     for i, (col, ch) in enumerate(zip(spend_cols, channels)):
@@ -181,13 +191,17 @@ def _fit_meridian(df, spend_cols, channels, season_feats, config):
             "roi": round(contrib / max(spend, 1), 4),
         })
 
-    # Saturation curves (exponential, on raw spend scale)
+    # Saturation curves (exponential, in FTB response units)
     saturation = []
     for i, (col, ch) in enumerate(zip(spend_cols, channels)):
         p = best_params[i]
         max_raw = max(float(df[col].max()) * 1.5, 1.0)
         spend_range = np.linspace(0, max_raw, 50)
-        curve = _exponential_saturation(spend_range, p["rate"])
+        # Simulate what model does: normalize by x_max then apply saturation
+        x_norm = spend_range / p["x_max"]
+        curve_raw = _exponential_saturation(x_norm, p["rate"])
+        # Scale by coefficient to show response in FTB units
+        curve = curve_raw * coefs[i]
 
         current = float(df[col].mean())
         threshold = float(df[col].quantile(0.75))
