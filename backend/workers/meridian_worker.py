@@ -115,7 +115,8 @@ def _fit_meridian(df, spend_cols, channels, season_feats, config):
     X_raw = df[spend_cols].values.astype(float)
 
     # Find best Weibull params per channel via grid search on correlation with y
-    # Use spend-weighted saturation to preserve channel scale differences
+    # Apply saturation on raw-scale adstocked spend (not normalized to 0-1)
+    # so Ridge sees genuine magnitude differences between channels
     best_params = []
     X_transformed = np.zeros_like(X_raw)
 
@@ -123,31 +124,27 @@ def _fit_meridian(df, spend_cols, channels, season_feats, config):
         best_corr = -1.0
         best_shape, best_scale, best_rate = 1.5, 3.0, 1.0
 
-        # Compute spend-based rate scaling: channels with higher spend need
-        # lower rates to saturate at realistic levels
-        channel_mean = X_raw[:, i].mean() or 1.0
-
         for shape in [0.5, 1.0, 1.5, 2.0, 3.0]:
             for scale in [1.0, 2.0, 3.0, 5.0]:
                 adstocked = _weibull_adstock(X_raw[:, i], shape, scale, l_max)
-                x_max = adstocked.max() or 1.0
-                x_norm = adstocked / x_max
+                ad_mean = adstocked.mean() or 1.0
 
-                for rate in [0.5, 1.0, 2.0, 3.0, 5.0]:
-                    saturated = _exponential_saturation(x_norm, rate)
+                # Rate is inverse-scaled to spend magnitude so saturation
+                # happens at a meaningful point on each channel's own scale
+                for rate_mult in [0.5, 1.0, 2.0, 3.0, 5.0]:
+                    rate = rate_mult / ad_mean
+                    saturated = _exponential_saturation(adstocked, rate)
                     corr = np.corrcoef(saturated, y)[0, 1]
                     if not np.isnan(corr) and corr > best_corr:
                         best_corr = corr
                         best_shape, best_scale, best_rate = shape, scale, rate
 
         adstocked = _weibull_adstock(X_raw[:, i], best_shape, best_scale, l_max)
-        x_max = adstocked.max() or 1.0
-        # Scale saturated output by channel mean spend to preserve relative magnitude
-        X_transformed[:, i] = _exponential_saturation(adstocked / x_max, best_rate) * channel_mean
+        X_transformed[:, i] = _exponential_saturation(adstocked, best_rate)
 
         best_params.append({
             "shape": best_shape, "scale": best_scale,
-            "rate": best_rate, "x_max": x_max, "channel_mean": channel_mean,
+            "rate": best_rate, "x_max": adstocked.max() or 1.0,
         })
 
     # Add seasonality controls
@@ -184,14 +181,13 @@ def _fit_meridian(df, spend_cols, channels, season_feats, config):
             "roi": round(contrib / max(spend, 1), 4),
         })
 
-    # Saturation curves (exponential, distinct from Hill/logistic)
+    # Saturation curves (exponential, on raw spend scale)
     saturation = []
     for i, (col, ch) in enumerate(zip(spend_cols, channels)):
         p = best_params[i]
         max_raw = max(float(df[col].max()) * 1.5, 1.0)
         spend_range = np.linspace(0, max_raw, 50)
-        x_norm = spend_range / p["x_max"]
-        curve = _exponential_saturation(x_norm, p["rate"])
+        curve = _exponential_saturation(spend_range, p["rate"])
 
         current = float(df[col].mean())
         threshold = float(df[col].quantile(0.75))

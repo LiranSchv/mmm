@@ -151,8 +151,12 @@ def _fit_robyn(df, spend_cols, channels, season_feats, config):
         ctrl_betas=ctrl_p,
     )
 
+    # Compute spend shares for the RSSD baseline (instead of uniform)
+    total_spend = X_raw.sum()
+    spend_shares = np.array([X_raw[:, i].sum() / max(total_spend, 1) for i in range(n_channels)])
+
     def loss_fn(thetas, alphas, gammas, betas, intercept, ctrl_betas):
-        """NRMSE loss — pure fit quality, let the data drive attribution."""
+        """NRMSE + light RSSD penalty against spend-proportional baseline."""
         # Transform spend
         X_transformed = np.zeros_like(X_raw)
         for i in range(n_channels):
@@ -173,7 +177,14 @@ def _fit_robyn(df, spend_cols, channels, season_feats, config):
         y_range = y.max() - y.min()
         nrmse = rmse / max(y_range, 1e-9)
 
-        return float(nrmse)
+        # Light RSSD: penalise deviation from spend-proportional shares
+        # (not uniform — channels that spend more should contribute more)
+        contribs = np.maximum(0, np.array([float(betas[i]) * float(X_transformed[:, i].mean()) for i in range(n_channels)]))
+        total_c = contribs.sum() + 1e-10
+        attr_shares = contribs / total_c
+        rssd = np.sqrt(np.mean((attr_shares - spend_shares) ** 2))
+
+        return float(nrmse + 0.02 * rssd)
 
     # ── Run optimization ────────────────────────────────────────────────────
     optimizer = ng.optimizers.TwoPointsDE(parametrization=param, budget=n_iter, num_workers=1)
