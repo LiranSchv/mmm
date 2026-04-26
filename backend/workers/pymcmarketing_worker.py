@@ -156,14 +156,18 @@ def _fit_pymc_mmm(
             # Baseline
             baseline = pm.Normal("baseline", mu=y_mean * 0.4, sigma=y_std)
 
-            # Seasonality
+            # Seasonality — limit to 4 most important controls via correlation
+            mu = baseline + pm.math.dot(X_sat, beta)
             if X_controls is not None and X_controls.shape[1] > 0:
-                gamma = pm.Normal("gamma", mu=0, sigma=y_std * 0.1, shape=X_controls.shape[1])
-                mu = baseline + pm.math.dot(X_sat, beta) + pm.math.dot(
-                    pt.as_tensor_variable(X_controls), gamma
-                )
-            else:
-                mu = baseline + pm.math.dot(X_sat, beta)
+                # Pick top controls by abs correlation with y to keep model small
+                n_keep = min(4, X_controls.shape[1])
+                corrs = np.array([abs(np.corrcoef(X_controls[:, j], y)[0, 1])
+                                  for j in range(X_controls.shape[1])])
+                corrs = np.nan_to_num(corrs, nan=0.0)
+                top_idx = np.argsort(corrs)[-n_keep:]
+                X_ctrl_reduced = X_controls[:, top_idx]
+                gamma = pm.Normal("gamma", mu=0, sigma=y_std * 0.1, shape=n_keep)
+                mu = mu + pm.math.dot(pt.as_tensor_variable(X_ctrl_reduced), gamma)
 
             sigma = pm.HalfNormal("sigma", sigma=y_std)
             pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y)
@@ -182,7 +186,7 @@ def _fit_pymc_mmm(
             else:
                 # ADVI: ~10x faster, good enough for channel attribution
                 approx = pm.fit(
-                    n=config.get("advi_iter", 10000),
+                    n=config.get("advi_iter", 5000),
                     method="advi",
                     random_seed=42,
                     progressbar=False,
