@@ -152,7 +152,7 @@ def _fit_robyn(df, spend_cols, channels, season_feats, config):
     )
 
     def loss_fn(thetas, alphas, gammas, betas, intercept, ctrl_betas):
-        """NRMSE + decomposition penalty (Robyn's DECOMP.RSSD)."""
+        """NRMSE loss — pure fit quality, let the data drive attribution."""
         # Transform spend
         X_transformed = np.zeros_like(X_raw)
         for i in range(n_channels):
@@ -173,16 +173,7 @@ def _fit_robyn(df, spend_cols, channels, season_feats, config):
         y_range = y.max() - y.min()
         nrmse = rmse / max(y_range, 1e-9)
 
-        # Decomposition concentration penalty (Robyn's DECOMP.RSSD)
-        # Penalise if one channel dominates too much
-        contribs = betas * np.array([X_transformed[:, i].mean() for i in range(n_channels)])
-        total = contribs.sum() + 1e-10
-        shares = contribs / total
-        # RSSD = root sum of squared deviations from uniform
-        uniform = 1.0 / max(n_channels, 1)
-        rssd = np.sqrt(np.mean((shares - uniform) ** 2))
-
-        return float(nrmse + 0.1 * rssd)
+        return float(nrmse)
 
     # ── Run optimization ────────────────────────────────────────────────────
     optimizer = ng.optimizers.TwoPointsDE(parametrization=param, budget=n_iter, num_workers=1)

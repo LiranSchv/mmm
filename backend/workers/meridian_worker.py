@@ -115,6 +115,7 @@ def _fit_meridian(df, spend_cols, channels, season_feats, config):
     X_raw = df[spend_cols].values.astype(float)
 
     # Find best Weibull params per channel via grid search on correlation with y
+    # Use spend-weighted saturation to preserve channel scale differences
     best_params = []
     X_transformed = np.zeros_like(X_raw)
 
@@ -122,10 +123,13 @@ def _fit_meridian(df, spend_cols, channels, season_feats, config):
         best_corr = -1.0
         best_shape, best_scale, best_rate = 1.5, 3.0, 1.0
 
+        # Compute spend-based rate scaling: channels with higher spend need
+        # lower rates to saturate at realistic levels
+        channel_mean = X_raw[:, i].mean() or 1.0
+
         for shape in [0.5, 1.0, 1.5, 2.0, 3.0]:
             for scale in [1.0, 2.0, 3.0, 5.0]:
                 adstocked = _weibull_adstock(X_raw[:, i], shape, scale, l_max)
-                # Normalise for saturation
                 x_max = adstocked.max() or 1.0
                 x_norm = adstocked / x_max
 
@@ -138,11 +142,12 @@ def _fit_meridian(df, spend_cols, channels, season_feats, config):
 
         adstocked = _weibull_adstock(X_raw[:, i], best_shape, best_scale, l_max)
         x_max = adstocked.max() or 1.0
-        X_transformed[:, i] = _exponential_saturation(adstocked / x_max, best_rate)
+        # Scale saturated output by channel mean spend to preserve relative magnitude
+        X_transformed[:, i] = _exponential_saturation(adstocked / x_max, best_rate) * channel_mean
 
         best_params.append({
             "shape": best_shape, "scale": best_scale,
-            "rate": best_rate, "x_max": x_max,
+            "rate": best_rate, "x_max": x_max, "channel_mean": channel_mean,
         })
 
     # Add seasonality controls
@@ -166,13 +171,11 @@ def _fit_meridian(df, spend_cols, channels, season_feats, config):
     coefs = model.coef_[:n_channels]
     intercept = model.intercept_
 
-    # Channel contributions
+    # Channel contributions = coef * sum(transformed_spend)
     total_ftbs = float(y.sum())
     contributions = []
     for i, (col, ch) in enumerate(zip(spend_cols, channels)):
-        # contribution = coef * mean(saturated_spend) * n_periods
-        mean_sat = float(X_transformed[:, i].mean())
-        contrib = float(coefs[i]) * mean_sat * len(df)
+        contrib = float((coefs[i] * X_transformed[:, i]).sum())
         spend = float(df[col].sum())
         contributions.append({
             "channel": ch,
